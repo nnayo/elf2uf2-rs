@@ -4,7 +4,7 @@ use clap::Parser;
 use elf::{read_and_check_elf32_ph_entries, realize_page, PAGE_SIZE};
 use once_cell::sync::OnceCell;
 use pbr::{ProgressBar, Units};
-use serialport::FlowControl;
+use serialport::{FlowControl, SerialPortInfo, SerialPortType::UsbPort, UsbPortInfo};
 use static_assertions::const_assert;
 use std::{
     error::Error,
@@ -173,97 +173,133 @@ fn elf2uf2(mut input: impl Read + Seek, mut output: impl Write) -> Result<(), Bo
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    OPTS.set(Opts::parse()).unwrap();
-
-    let serial_ports_before = serialport::available_ports()?;
-    let mut deployed_path = None;
-
-    {
-        let input = BufReader::new(File::open(&Opts::global().input)?);
-
-        let output = if Opts::global().deploy {
-            let sys = sysinfo::System::new_all();
-
-            let mut pico_drive = None;
-            for disk in sys.disks() {
-                let mount = disk.mount_point();
-
-                if mount.join("INFO_UF2.TXT").is_file() {
-                    println!("Found pico uf2 disk {}", &mount.to_string_lossy());
-                    pico_drive = Some(mount.to_owned());
-                    break;
+fn available_serial_port(serial_ports_before: Vec<SerialPortInfo>) -> Option<SerialPortInfo> {
+    if Opts::global().deploy {
+        // delay counter to wait for the serial port to pop up once the pico rebooted
+        for _ in 0..10 {
+            if let Ok(available_ports) = serialport::available_ports() {
+                // loop on newly found serial port(s)
+                for port in available_ports {
+                    // any new port is the winner
+                    if !serial_ports_before.contains(&port) {
+                        println!("Found pico serial on {}", &port.port_name);
+                        return Some(port);
+                    }
                 }
             }
 
-            if let Some(pico_drive) = pico_drive {
-                deployed_path = Some(pico_drive.join("out.uf2"));
-                File::create(deployed_path.as_ref().unwrap())?
-            } else {
-                return Err("Unable to find mounted pico".into());
-            }
-        } else {
-            File::create(Opts::global().output_path())?
-        };
-
-        if let Err(err) = elf2uf2(input, output) {
-            if Opts::global().deploy {
-                fs::remove_file(deployed_path.unwrap())?;
-            } else {
-                fs::remove_file(Opts::global().output_path())?;
-            }
-            return Err(err);
+            thread::sleep(Duration::from_millis(200));
         }
+
+        return None;
+    } else {
+        // list of known pico USB vid/pid
+        let pico_usb_ref = [UsbPortInfo {
+            vid: 0x16c0,
+            pid: 0x27dd,
+            // the following fields are not used in the check
+            serial_number: None,
+            manufacturer: None,
+            product: None,
+        }];
+
+        // loop over all the found serial port's) to find a USB one that fits
+        for port in serialport::available_ports().unwrap() {
+            match port.port_type {
+                UsbPort(ref p) => {
+                    for p_ref in &pico_usb_ref {
+                        if p.vid == p_ref.vid && p.pid == p_ref.pid {
+                            println!("Found pico serial on {}", &port.port_name);
+                            return Some(port);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+}
+
+fn serial_comm(serial_ports_before: Vec<serialport::SerialPortInfo>) -> Result<(), Box<dyn Error>> {
+    if let Some(serial_port_info) = available_serial_port(serial_ports_before) {
+        for _ in 0..5 {
+            if let Ok(mut port) = serialport::new(&serial_port_info.port_name, 115200)
+                .timeout(Duration::from_millis(100))
+                .flow_control(FlowControl::Hardware)
+                .open()
+            {
+                if port.write_data_terminal_ready(true).is_ok() {
+                    let mut serial_buf = [0; 1024];
+                    loop {
+                        match port.read(&mut serial_buf) {
+                            Ok(t) => {
+                                io::stdout().write_all(&serial_buf[..t])?;
+                                io::stdout().flush()?;
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    OPTS.set(Opts::parse()).unwrap();
+
+    // save list of possible serial ports
+    // when the deployment is done, a new one shall pop up
+    // that is the pico after rebooting
+    let serial_ports_before = serialport::available_ports()?;
+
+    let mut deployed_path = None;
+
+    let output = if Opts::global().deploy {
+        let sys = sysinfo::System::new_all();
+
+        let mut pico_drive = None;
+        for disk in sys.disks() {
+            let mount = disk.mount_point();
+
+            if mount.join("INFO_UF2.TXT").is_file() {
+                println!("Found pico uf2 disk {}", &mount.to_string_lossy());
+                pico_drive = Some(mount.to_owned());
+                break;
+            }
+        }
+
+        if let Some(pico_drive) = pico_drive {
+            deployed_path = Some(pico_drive.join("out.uf2"));
+            File::create(deployed_path.as_ref().unwrap())?
+        } else {
+            return Err("Unable to find mounted pico".into());
+        }
+    } else {
+        File::create(Opts::global().output_path())?
+    };
+
+    let input = BufReader::new(File::open(&Opts::global().input)?);
+
+    if let Err(err) = elf2uf2(input, output) {
+        if Opts::global().deploy {
+            fs::remove_file(deployed_path.unwrap())?;
+        } else {
+            fs::remove_file(Opts::global().output_path())?;
+        }
+        return Err(err);
     }
 
     // New line after progress bar
     println!();
 
     if Opts::global().serial {
-        let mut counter = 0;
-
-        let serial_port_info = 'find_loop: loop {
-            for port in serialport::available_ports()? {
-                if !serial_ports_before.contains(&port) {
-                    println!("Found pico serial on {}", &port.port_name);
-                    break 'find_loop Some(port);
-                }
-            }
-
-            counter += 1;
-
-            if counter == 10 {
-                break None;
-            }
-
-            thread::sleep(Duration::from_millis(200));
-        };
-
-        if let Some(serial_port_info) = serial_port_info {
-            for _ in 0..5 {
-                if let Ok(mut port) = serialport::new(&serial_port_info.port_name, 115200)
-                    .timeout(Duration::from_millis(100))
-                    .flow_control(FlowControl::Hardware)
-                    .open()
-                {
-                    if port.write_data_terminal_ready(true).is_ok() {
-                        let mut serial_buf = [0; 1024];
-                        loop {
-                            match port.read(&mut serial_buf) {
-                                Ok(t) => {
-                                    io::stdout().write_all(&serial_buf[..t])?;
-                                    io::stdout().flush()?;
-                                }
-                                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                    }
-                }
-
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
+        serial_comm(serial_ports_before).unwrap();
     }
 
     Ok(())
